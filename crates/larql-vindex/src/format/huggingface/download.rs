@@ -55,9 +55,8 @@ pub fn resolve_hf_vindex(hf_path: &str) -> Result<PathBuf, VindexError> {
         ))
     };
 
-    // Download index.json first (small, tells us what we need)
-
-    
+    // Download index.json first — the rest of the snapshot pivots off
+    // its parent directory, so we always need it before anything else.
     let index_path = repo.get(INDEX_JSON).map_err(|e| {
         VindexError::Parse(format!(
             "failed to download index.json from hf://{}: {e}",
@@ -70,9 +69,17 @@ pub fn resolve_hf_vindex(hf_path: &str) -> Result<PathBuf, VindexError> {
         .ok_or_else(|| VindexError::Parse("cannot determine vindex directory".into()))?
         .to_path_buf();
 
-    // Download core files (needed for browse)
-    for filename in VINDEX_CORE_FILES {
-        if *filename == INDEX_JSON {
+    // Pull every file in the repo. We list it live via HF's tree API
+    // rather than iterating a hardcoded filename whitelist — modern
+    // vindexes ship Q4K-quantized weight files (`attn_weights_q4k.bin`,
+    // `interleaved_q4k.bin`, manifests, …) and per-layer files under
+    // `layers/`, none of which a static list would keep in sync. If the
+    // listing fails (offline, auth, transient HTTP), fall back to the
+    // legacy `VINDEX_CORE_FILES` + `VINDEX_WEIGHT_FILES` union so we
+    // never regress to "only index.json got pulled".
+    let to_fetch = repo_files_or_fallback(&repo_id, revision.as_deref());
+    for filename in &to_fetch {
+        if filename == INDEX_JSON {
             continue; // already downloaded
         }
         let _ = repo.get(filename); // optional file, skip if missing
@@ -82,40 +89,14 @@ pub fn resolve_hf_vindex(hf_path: &str) -> Result<PathBuf, VindexError> {
 }
 
 /// Download additional weight files for inference/compile.
-/// Called lazily when INFER or COMPILE is first used.
+///
+/// **Now redundant** — `resolve_hf_vindex` and
+/// `resolve_hf_vindex_with_progress` pull every file in the repo (via
+/// the HF tree API), so a successful pull already includes weights.
+/// Kept as a thin delegate so out-of-tree callers that explicitly drive
+/// the lazy-weight path still work.
 pub fn download_hf_weights(hf_path: &str) -> Result<(), VindexError> {
-    let path = hf_path
-        .strip_prefix("hf://")
-        .ok_or_else(|| VindexError::Parse(format!("not an hf:// path: {hf_path}")))?;
-
-    let (repo_id, revision) = if let Some((repo, rev)) = path.split_once('@') {
-        (repo.to_string(), Some(rev.to_string()))
-    } else {
-        (path.to_string(), None)
-    };
-
-    // See note in `resolve_hf_vindex` re: `from_env()` vs `Api::new()`.
-    let api = hf_hub::api::sync::ApiBuilder::from_env()
-        .build()
-        .map_err(|e| VindexError::Parse(format!("HuggingFace API init failed: {e}")))?;
-
-    let repo = if let Some(ref rev) = revision {
-        api.repo(hf_hub::Repo::with_revision(
-            repo_id.clone(),
-            hf_hub::RepoType::Model,
-            rev.clone(),
-        ))
-    } else {
-        api.repo(hf_hub::Repo::new(
-            repo_id.clone(),
-            hf_hub::RepoType::Model,
-        ))
-    };
-
-    for filename in VINDEX_WEIGHT_FILES {
-        let _ = repo.get(filename); // optional, skip if not in repo
-    }
-
+    let _ = resolve_hf_vindex(hf_path)?;
     Ok(())
 }
 
@@ -358,12 +339,85 @@ where
         .ok_or_else(|| VindexError::Parse("cannot determine vindex directory".into()))?
         .to_path_buf();
 
-    for filename in VINDEX_CORE_FILES {
-        if *filename == INDEX_JSON {
+    // See `resolve_hf_vindex` for why we list-then-fetch instead of
+    // iterating a static filename list.
+    let to_fetch = repo_files_or_fallback(&repo_id, revision.as_deref());
+    for filename in &to_fetch {
+        if filename == INDEX_JSON {
             continue;
         }
         // Optional files — ignore failures (missing from repo is fine).
         let _ = fetch(filename, filename);
     }
     Ok(vindex_dir)
+}
+
+/// List every file path in the repo via HF's tree API, recursive. Returns
+/// paths relative to the repo root (e.g. `"index.json"`,
+/// `"layers/layer_00.weights"`). Directory entries are filtered out.
+///
+/// Hits `https://huggingface.co/api/models/{repo_id}/tree/{rev}?recursive=true`
+/// — the same endpoint shape `publish::fetch_remote_lfs_oids` uses, but
+/// model-typed and without the LFS-only filter. Sends the bearer token
+/// when one is configured so private repos work.
+fn list_repo_files(
+    repo_id: &str,
+    revision: Option<&str>,
+) -> Result<Vec<String>, VindexError> {
+    let rev = revision.unwrap_or("main");
+    let url = format!("https://huggingface.co/api/models/{repo_id}/tree/{rev}?recursive=true");
+    let token = get_hf_token().ok();
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| VindexError::Parse(format!("HF tree client init: {e}")))?;
+    let mut req = client.get(&url);
+    if let Some(t) = token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+    let resp = req
+        .send()
+        .map_err(|e| VindexError::Parse(format!("HF tree fetch failed: {e}")))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(VindexError::Parse(format!(
+            "HF tree {url} -> HTTP {status}"
+        )));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .map_err(|e| VindexError::Parse(format!("HF tree JSON: {e}")))?;
+    let arr = body
+        .as_array()
+        .ok_or_else(|| VindexError::Parse(format!("HF tree response not an array: {body}")))?;
+
+    let mut files = Vec::with_capacity(arr.len());
+    for entry in arr {
+        if entry.get("type").and_then(|v| v.as_str()) != Some("file") {
+            continue;
+        }
+        if let Some(p) = entry.get("path").and_then(|v| v.as_str()) {
+            files.push(p.to_string());
+        }
+    }
+    Ok(files)
+}
+
+/// Try [`list_repo_files`]; on failure fall back to the static
+/// `VINDEX_CORE_FILES ∪ VINDEX_WEIGHT_FILES` list. Always returns
+/// something, so callers can iterate unconditionally.
+///
+/// The fallback exists for offline / auth-degraded scenarios where the
+/// tree API is unreachable — better to attempt the legacy filename set
+/// than to bail with no files at all.
+fn repo_files_or_fallback(repo_id: &str, revision: Option<&str>) -> Vec<String> {
+    match list_repo_files(repo_id, revision) {
+        Ok(files) => files,
+        Err(_) => VINDEX_CORE_FILES
+            .iter()
+            .chain(VINDEX_WEIGHT_FILES.iter())
+            .map(|s| s.to_string())
+            .collect(),
+    }
 }
