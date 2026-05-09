@@ -39,17 +39,19 @@ pub fn resolve_hf_vindex(hf_path: &str) -> Result<PathBuf, VindexError> {
     let repo = if let Some(ref rev) = revision {
         api.repo(hf_hub::Repo::with_revision(
             repo_id.clone(),
-            hf_hub::RepoType::Dataset,
+            hf_hub::RepoType::Model,
             rev.clone(),
         ))
     } else {
         api.repo(hf_hub::Repo::new(
             repo_id.clone(),
-            hf_hub::RepoType::Dataset,
+            hf_hub::RepoType::Model,
         ))
     };
 
     // Download index.json first (small, tells us what we need)
+
+    
     let index_path = repo.get(INDEX_JSON).map_err(|e| {
         VindexError::Parse(format!(
             "failed to download index.json from hf://{}: {e}",
@@ -92,13 +94,13 @@ pub fn download_hf_weights(hf_path: &str) -> Result<(), VindexError> {
     let repo = if let Some(ref rev) = revision {
         api.repo(hf_hub::Repo::with_revision(
             repo_id.clone(),
-            hf_hub::RepoType::Dataset,
+            hf_hub::RepoType::Model,
             rev.clone(),
         ))
     } else {
         api.repo(hf_hub::Repo::new(
             repo_id.clone(),
-            hf_hub::RepoType::Dataset,
+            hf_hub::RepoType::Model,
         ))
     };
 
@@ -122,7 +124,7 @@ pub use hf_hub::api::Progress as DownloadProgress;
 /// hf-hub 0.5 lays the cache out as:
 ///
 ///   ```text
-///   ~/.cache/huggingface/hub/datasets--{owner}--{name}/
+///   ~/.cache/huggingface/hub/models--{owner}--{name}/
 ///     ├── blobs/<etag>            actual file bytes
 ///     └── snapshots/<commit>/     symlinks → blobs
 ///         └── <filename>
@@ -193,7 +195,10 @@ fn head_etag_and_size(
     filename: &str,
 ) -> Option<(String, u64)> {
     let rev = revision.unwrap_or("main");
-    let url = format!("https://huggingface.co/datasets/{repo_id}/resolve/{rev}/{filename}");
+    // Model repos resolve at `huggingface.co/{repo_id}/...` (no `datasets/` prefix).
+    // Must match the `RepoType::Model` used by the hf-hub `Repo` above so the
+    // cache probe and the actual download read the same blob.
+    let url = format!("https://huggingface.co/{repo_id}/resolve/{rev}/{filename}");
     let token = get_hf_token().ok();
 
     // **No redirects.** HF LFS files 302 → S3, and `X-Linked-Etag` +
@@ -245,8 +250,8 @@ fn strip_etag_quoting(raw: &str) -> String {
     no_weak.trim_matches('"').to_string()
 }
 
-/// Resolve the hf-hub cache directory for a dataset repo: the root of
-/// `~/.cache/huggingface/hub/datasets--{owner}--{name}/`. Honours
+/// Resolve the hf-hub cache directory for a model repo: the root of
+/// `~/.cache/huggingface/hub/models--{owner}--{name}/`. Honours
 /// `HF_HOME` and `HUGGINGFACE_HUB_CACHE` env overrides that hf-hub itself
 /// respects.
 fn hf_cache_repo_dir(repo_id: &str) -> Option<PathBuf> {
@@ -262,7 +267,7 @@ fn hf_cache_repo_dir(repo_id: &str) -> Option<PathBuf> {
             .join("hub")
     };
     let safe = repo_id.replace('/', "--");
-    Some(hub_root.join(format!("datasets--{safe}")))
+    Some(hub_root.join(format!("models--{safe}")))
 }
 
 /// Like [`resolve_hf_vindex`], but drives a progress reporter per file.
@@ -302,13 +307,13 @@ where
     let repo = if let Some(ref rev) = revision {
         api.repo(hf_hub::Repo::with_revision(
             repo_id.clone(),
-            hf_hub::RepoType::Dataset,
+            hf_hub::RepoType::Model,
             rev.clone(),
         ))
     } else {
         api.repo(hf_hub::Repo::new(
             repo_id.clone(),
-            hf_hub::RepoType::Dataset,
+            hf_hub::RepoType::Model,
         ))
     };
 
