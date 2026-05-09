@@ -7,7 +7,7 @@
 //! removes the entry directory if it was a real dir). **The original
 //! path `larql link` pointed at is never touched.**
 //!
-//! For HF entries this removes the whole `datasets--<owner>--<name>`
+//! For HF entries this removes the whole `models--<owner>--<name>`
 //! tree from the HF hub cache.
 
 use clap::Args;
@@ -44,7 +44,7 @@ pub fn run(args: RmArgs) -> Result<(), Box<dyn std::error::Error>> {
             )
         }
         CacheSource::HuggingFace => {
-            // Back up from `snapshots/<sha>/` → `datasets--<owner>--<name>/`.
+            // Back up from `snapshots/<sha>/` → `models--<owner>--<name>/`.
             let hub_repo_dir = entry
                 .snapshot
                 .parent()
