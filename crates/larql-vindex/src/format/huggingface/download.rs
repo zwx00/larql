@@ -32,8 +32,14 @@ pub fn resolve_hf_vindex(hf_path: &str) -> Result<PathBuf, VindexError> {
         (path.to_string(), None)
     };
 
-    // Use hf-hub to download
-    let api = hf_hub::api::sync::Api::new()
+    // Use hf-hub to download. `ApiBuilder::from_env()` honours `HF_HOME`
+    // and `HF_ENDPOINT` like every other HF tool; `Api::new()` does not,
+    // so pulls would land in `~/.cache/huggingface/hub/` regardless of
+    // the user's `HF_HOME`, while `cache.rs::hf_hub_dir()` (driving
+    // `larql list` / `larql run`) does honour it. Use `from_env()` here
+    // so reads and writes target the same directory.
+    let api = hf_hub::api::sync::ApiBuilder::from_env()
+        .build()
         .map_err(|e| VindexError::Parse(format!("HuggingFace API init failed: {e}")))?;
 
     let repo = if let Some(ref rev) = revision {
@@ -88,7 +94,9 @@ pub fn download_hf_weights(hf_path: &str) -> Result<(), VindexError> {
         (path.to_string(), None)
     };
 
-    let api = hf_hub::api::sync::Api::new()
+    // See note in `resolve_hf_vindex` re: `from_env()` vs `Api::new()`.
+    let api = hf_hub::api::sync::ApiBuilder::from_env()
+        .build()
         .map_err(|e| VindexError::Parse(format!("HuggingFace API init failed: {e}")))?;
 
     let repo = if let Some(ref rev) = revision {
@@ -301,7 +309,9 @@ where
         (path.to_string(), None)
     };
 
-    let api = hf_hub::api::sync::Api::new()
+    // See note in `resolve_hf_vindex` re: `from_env()` vs `Api::new()`.
+    let api = hf_hub::api::sync::ApiBuilder::from_env()
+        .build()
         .map_err(|e| VindexError::Parse(format!("HuggingFace API init failed: {e}")))?;
 
     let repo = if let Some(ref rev) = revision {
